@@ -4,7 +4,8 @@
 
 **A menu-driven installer for [Arch Linux](https://archlinux.org).**
 One script, one disk, a full system: encryption, Secure Boot, snapshots,
-your choice of boot loader, desktops or window managers, and popular dotfiles.
+ZFS, your choice of boot loader, desktops or window managers, and popular
+dotfiles.
 
 [![License: GPL v2](https://img.shields.io/badge/license-GPL--2.0--only-blue.svg)](LICENSE)
 ![Version](https://img.shields.io/badge/version-1.0-brightgreen.svg)
@@ -52,11 +53,11 @@ The full guide is in the [manual (PDF)](docs/arch-install-manual.pdf).
 | | |
 |---|---|
 | **Firmware** | UEFI (64-bit or 32-bit) and legacy BIOS, on GPT |
-| **Filesystem** | ext4, or btrfs with subvolumes (`@`, `@home`, `@snapshots`, ...) |
-| **Snapshots** | snapper before and after every pacman transaction, plus hourly; bootable from GRUB |
-| **Encryption** | none, LUKS1 or LUKS2 on the root partition (systemd `sd-encrypt`) |
+| **Filesystem** | ext4, btrfs with subvolumes (`@`, `@home`, `@snapshots`, ...), or **ZFS** (archzfs) |
+| **Snapshots** | btrfs: snapper before and after every pacman transaction, plus hourly, bootable from GRUB. ZFS: before every pacman transaction, bootable from ZFSBootMenu |
+| **Encryption** | none, LUKS1 or LUKS2 on the root partition (systemd `sd-encrypt`); ZFS sits on LUKS2 |
 | **Secure Boot** | your own keys with sbctl; everything signed and re-signed on updates |
-| **Boot loader** | GRUB, Limine, systemd-boot, rEFInd, UKI, EFISTUB, SYSLINUX/EXTLINUX |
+| **Boot loader** | GRUB, Limine, systemd-boot, rEFInd, UKI, EFISTUB, SYSLINUX/EXTLINUX; ZFSBootMenu for ZFS |
 | **Kernels** | linux, linux-lts, linux-zen, linux-hardened, in the boot order you choose |
 | **Swap** | zram (zram-generator), swap file, or none |
 | **Desktops** | KDE Plasma, GNOME, Xfce, COSMIC, Cinnamon, MATE, LXQt, Budgie, Enlightenment |
@@ -111,6 +112,41 @@ On btrfs, **Snapshots** sets up snapper on the `@snapshots` subvolume:
 
 `/home` is a separate subvolume and is not rolled back.
 
+## ZFS
+
+<div align="center">
+<img src="docs/screenshots/zfs.png" alt="Choosing ZFS" width="600">
+</div>
+
+Choose **zfs** in the Filesystem item (64-bit UEFI only). ZFS is not in Arch's
+official repositories, so the installer uses the signed
+[archzfs](https://github.com/archzfs/archzfs) repository. Its key's
+fingerprint (`3A9917BF0DED5C13F69AC68FABEC0A1208037BE9`) is checked before
+pacman trusts it.
+
+- **Live ISO**: the prebuilt module when it matches the ISO's kernel,
+  otherwise `zfs-dkms` with that kernel's headers from the Arch Linux Archive.
+- **Pool** `zroot` on the root partition, or on **LUKS2** with encryption:
+  `zroot/ROOT/arch` holds `/` and `/boot` (kernels are part of every
+  snapshot), `zroot/home`, `zroot/var/log` and `zroot/var/cache/pacman` are
+  separate. lz4 compression, POSIX ACLs.
+- **ZFSBootMenu** boots it: built on the new system from its pinned 3.1.0
+  release, with mkinitcpio. Its release images cannot unlock LUKS; the local
+  build can. It asks for the passphrase once, lists the boot environments and
+  their snapshots, and starts the kernel. The system's own initramfs unlocks
+  the disk a second time with a key file that lies inside the encrypted
+  pool. The ZFSBootMenu image on the unencrypted EFI partition holds no key,
+  and the installer checks that.
+- **Modules** for each kernel: prebuilt when archzfs has the installed
+  kernel's version, otherwise `zfs-dkms`. The LTS kernel is suggested:
+  a prebuilt module pins its kernel version, so `pacman -Syu` waits until
+  archzfs catches up with a new kernel, and LTS updates least often.
+- **Snapshots**: `zroot/ROOT/arch@install` after installing, and with
+  Snapshots on, one before every pacman transaction (the newest 10 kept). In
+  ZFSBootMenu, select the boot environment and press Ctrl-S to boot one.
+- No swap file (zram instead) and no Secure Boot: ZFSBootMenu starts the
+  kernel with kexec, which the firmware does not check.
+
 ## Kernels and boot order
 
 <div align="center">
@@ -159,6 +195,7 @@ that looks like it does is refused. Each install also leaves its settings in
 | `i3-cachyos` | `i3-cachyos@3510e5580817ad80` | i3 with CachyOS's settings, btrfs + snapshots, paru |
 | `gaming-kde` | `gaming-kde@190f075a2dd56ce0` | KDE, linux-zen, Steam, Wine, Lutris, GameMode, controllers |
 | `secure-gnome` | `secure-gnome@ca58c00b72d8b8b4` | GNOME, unified kernel images, Secure Boot |
+| `zfs-plasma` | `zfs-plasma@aa4dbdcbc6470c21` | KDE Plasma on ZFS, ZFSBootMenu, LTS kernel, ZFS snapshots |
 
 All use LUKS2 encryption; change anything in the menu after loading.
 
@@ -176,9 +213,9 @@ Other options: `--preset`, `--help`, `--version`.
 ## Project status
 
 Version 1.0. Lint-clean, and tested with a simulated install of every boot
-loader (GRUB, Limine, systemd-boot, rEFInd, UKI, EFISTUB, SYSLINUX; UEFI and
-BIOS), Secure Boot, snapper, the AUR paths and presets: about 450 automated
-checks. **Nothing has been installed on real hardware or in a virtual machine
+loader (GRUB, Limine, systemd-boot, rEFInd, UKI, EFISTUB, SYSLINUX,
+ZFSBootMenu; UEFI and BIOS), Secure Boot, snapper, ZFS, the AUR paths and
+presets: about 530 automated checks. **Nothing has been installed on real hardware or in a virtual machine
 yet.** See the [changelog](CHANGELOG.md) for exactly what was and was not
 tested.
 

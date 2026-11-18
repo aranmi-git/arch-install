@@ -6,7 +6,7 @@ First release: a port of
 [void-install](https://github.com/aranmi-git/void-install) 1.7 to Arch Linux.
 
 ### The same as void-install
-- Menu-driven (dialog) whole-disk install: UEFI or BIOS, GPT, ext4 or btrfs,
+- Menu-driven (dialog) whole-disk install: UEFI or BIOS, GPT, ext4, btrfs or ZFS,
   no encryption, LUKS1 or LUKS2, seven boot methods, any kernels in your boot
   order, users with sudo levels.
 - Desktops and window managers (pick several), login screens, 21 dotfile
@@ -30,6 +30,20 @@ First release: a port of
 - **btrfs snapshots with snapper**: on the `@snapshots` subvolume (so a
   rollback of `@` keeps them), snap-pac before/after every pacman
   transaction, an hourly timeline, and grub-btrfs for GRUB.
+- **ZFS** from the signed archzfs repository (key fingerprint checked):
+  the live ISO gets ZFS first (prebuilt module, or zfs-dkms with the ISO
+  kernel's headers from the Arch Linux Archive); pool `zroot` on the root
+  partition or on LUKS2, boot environment `zroot/ROOT/arch` with `/boot`
+  inside it, separate `home`, `var/log` and `var/cache/pacman` datasets.
+  Prebuilt modules when they match the installed kernels, zfs-dkms when not.
+- **ZFSBootMenu** 3.1.0, built on the new system from the pinned release with
+  mkinitcpio's encrypt hook, because the release images cannot unlock LUKS.
+  One passphrase prompt; the system's initramfs unlocks again with a key file
+  inside the encrypted pool. The image on the EFI partition is checked to
+  hold no key. Rebuilt by a pacman hook after kernel or ZFS updates, and
+  copied to the firmware's fallback path.
+- **ZFS snapshots**: one of the fresh install, and optionally one before
+  every pacman transaction (newest 10 kept), bootable from ZFSBootMenu.
 - **Hyprland** (with hyprlock, hypridle, hyprpaper, waybar) and a CachyOS
   Hyprland dotfile preset; **COSMIC**; **Ly** and the COSMIC greeter as login
   screens.
@@ -63,16 +77,21 @@ First release: a port of
 
 ### Automated, in this sandbox
 - `shellcheck` clean with every optional check on.
-- **Simulated install** (240 checks): the configure, package, boot loader and
+- **Simulated install** (296 checks): the configure, package, boot loader and
   finishing steps against a fake system tree, for GRUB with an encrypted
-  `/boot`, systemd-boot, UKI, Limine and rEFInd on UEFI, EFISTUB, and GRUB,
-  SYSLINUX and Limine on BIOS. Everything the installer writes itself is real
+  `/boot`, systemd-boot, UKI, Limine and rEFInd on UEFI, EFISTUB, ZFS with
+  ZFSBootMenu (on LUKS2 and plain), and GRUB, SYSLINUX and Limine on BIOS. Everything the installer writes itself is real
   and checked (configs, pacman hooks, `update-boot-menu`, `update-limine`,
   `arch-kernel-order`, boot entries, UEFI boot order); pacman, mkinitcpio,
-  bootctl, grub-install, sbctl and snapper are stand-ins.
+  bootctl, grub-install, sbctl, snapper, zfs, zpool and generate-zbm are
+  stand-ins.
 - Secure Boot in and out of Setup Mode, snapper set-up, AUR routing, the
   OpenLinkHub pinned build, no password in any file or log.
-- **Presets** (157 checks) and **choice logic** (55 checks).
+- **Presets** (158 checks) and **choice logic** (76 checks), including which
+  ZFS module is installed for which kernel.
+- The archzfs key check against the real key files: the release key is
+  accepted and verifies the real archzfs database; a substituted key is
+  refused.
 
 ### Not tested
 - **No real install yet**, on hardware or in a virtual machine: the Arch ISO,
@@ -84,3 +103,5 @@ First release: a port of
   are missing instead of failing.
 - Secure Boot enrollment on real firmware, GRUB with Secure Boot, and booting
   snapshots from GRUB.
+- ZFS on a real live ISO (module install, pool creation), building
+  ZFSBootMenu, and its LUKS unlock and kexec on real hardware.

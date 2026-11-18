@@ -90,11 +90,23 @@ GUID_LUKS=CA7D7CCB-63ED-4C53-861C-1742536059CC
 
 ALL_KERNELS="linux linux-lts linux-zen linux-hardened"
 
+# ZFS: the archzfs repository (prebuilt modules for each Arch kernel)
+ZPOOL=zroot
+ZFS_BE=zroot/ROOT/arch
+ARCHZFS_SERVER=https://github.com/archzfs/archzfs/releases/download/experimental
+ARCHZFS_KEY=3A9917BF0DED5C13F69AC68FABEC0A1208037BE9
+ZBM_VERSION=3.1.0
+ZBM_GIT=https://github.com/zbm-dev/zfsbootmenu
+ZBM_COMMIT=7174e420590a270ece3c6426bdb1d5cdd9ef27b0
+# The archzfs release key, from the project's keyring repository (pinned commit)
+ARCHZFS_KEYRING=https://raw.githubusercontent.com/archzfs/archzfs-keyring/82e6ac2d2001f1ff8f92f50f7d4cf97069b74659/keyring/packager/archzfs
+ARCHZFS_UID=ArchZFS_Project__https___github.com_archzfs__51bd577f
+
 # ---- user choices (defaults) ------------------------------------------------
 DISK=""
-FS=ext4                 # ext4 | btrfs
+FS=ext4                 # ext4 | btrfs | zfs (zfs: ZFSBootMenu, pool on LUKS)
 ENC=luks2               # none | luks1 | luks2
-BOOTLOADER=grub         # grub | limine | systemd-boot | refind | uki | efistub | syslinux
+BOOTLOADER=grub         # grub | limine | systemd-boot | refind | uki | efistub | syslinux | zfsbootmenu
 GRUB_BOOT=encrypted     # encrypted | separate   (only GRUB + encryption)
 SECUREBOOT=0            # 1 = sign the boot chain with your own keys (sbctl)
 SNAPPER=0               # 1 = snapper snapshots of / (btrfs only)
@@ -170,16 +182,21 @@ grub_unlocks()     { [[ $BOOTLOADER == grub && $ENC != none && $GRUB_BOOT == enc
 # (mounted at /boot): the firmware or boot manager can only read FAT.
 kernels_on_esp()   { [[ $BOOTLOADER == limine || $BOOTLOADER == systemd-boot || $BOOTLOADER == refind || $BOOTLOADER == efistub ]]; }
 # Methods that need 64-bit UEFI / BIOS firmware.
-uefi_only()        { [[ $BOOTLOADER == systemd-boot || $BOOTLOADER == refind || $BOOTLOADER == uki || $BOOTLOADER == efistub ]]; }
+uefi_only()        { [[ $BOOTLOADER == systemd-boot || $BOOTLOADER == refind || $BOOTLOADER == uki || $BOOTLOADER == efistub || $BOOTLOADER == zfsbootmenu ]]; }
 bios_only()        { [[ $BOOTLOADER == syslinux ]]; }
 # Methods whose menu is written by /usr/local/bin/update-boot-menu.
-uses_boot_menu()   { uefi_only || bios_only; }
+uses_boot_menu()   { { uefi_only || bios_only; } && [[ $BOOTLOADER != zfsbootmenu ]]; }
 boot_is_separate() { kernels_on_esp || bios_only || [[ $BOOTLOADER == grub && $ENC != none && $GRUB_BOOT == separate ]]; }
 efi_arch()         { if [[ $EFI_BITS == 32 ]]; then echo ia32; else echo x64; fi; }
 # Boot methods that Secure Boot is offered for (the firmware checks each step).
 sb_capable()       { [[ $BOOTLOADER == systemd-boot || $BOOTLOADER == uki || $BOOTLOADER == efistub || $BOOTLOADER == refind || $BOOTLOADER == grub ]]; }
 secureboot_on()    { [[ $SECUREBOOT == 1 && $FIRMWARE == uefi && $EFI_BITS == 64 ]] && sb_capable; }
 snapper_on()       { [[ $SNAPPER == 1 && $FS == btrfs ]]; }
+zfs_on()           { [[ $FS == zfs ]]; }
+zfs_snap_on()      { [[ $SNAPPER == 1 && $FS == zfs ]]; }
+# A key file in the initramfs unlocks root a second time: after GRUB (encrypted
+# /boot) or ZFSBootMenu (pool on LUKS) already asked for the passphrase.
+needs_keyfile()    { grub_unlocks || { zfs_on && encrypted; }; }
 aur_on()           { [[ $AUR_HELPER == yay || $AUR_HELPER == paru ]]; }
 
 grub_efi_target() {
@@ -492,8 +509,8 @@ compute_layout() {
 		if boot_is_separate; then
 			ESP_MOUNT=/boot
 			ESP_SIZE=$BOOT_SIZE_MIB
-		elif [[ $BOOTLOADER == uki ]]; then
-			ESP_MOUNT=/boot/efi      # kernels stay in /boot; the UKIs (~50-100 MiB each) go here
+		elif [[ $BOOTLOADER == uki || $BOOTLOADER == zfsbootmenu ]]; then
+			ESP_MOUNT=/boot/efi      # kernels stay in /boot; the UKIs or ZFSBootMenu images go here
 			ESP_SIZE=$BOOT_SIZE_MIB
 		else
 			ESP_MOUNT=/boot/efi
@@ -550,7 +567,7 @@ required_mib() {
 	local mib=$((MIN_ROOT_GIB * 1024 + 8 + ESP_SIZE))
 	if [[ -n $BIOSBOOT_PART ]]; then mib=$((mib + BIOSBOOT_SIZE_MIB)); fi
 	if [[ -n $BOOT_PART ]]; then mib=$((mib + BOOT_SIZE_MIB)); fi
-	if [[ $SWAP == file ]]; then mib=$((mib + SWAP_SIZE * 1024)); fi
+	if [[ $SWAP == file ]] && ! zfs_on; then mib=$((mib + SWAP_SIZE * 1024)); fi
 	echo "$mib"
 }
 
@@ -579,7 +596,9 @@ layout_lines() {
 			*) layout_row "$BOOT_PART" "${BOOT_SIZE_MIB} MiB" "ext4 -> /boot" ;;
 		esac
 	fi
-	if encrypted; then rootdesc="$(enc_desc) -> $FS -> /"; else rootdesc="$FS -> /"; fi
+	if zfs_on; then
+		if encrypted; then rootdesc="$(enc_desc) -> ZFS pool $ZPOOL -> /"; else rootdesc="ZFS pool $ZPOOL -> /"; fi
+	elif encrypted; then rootdesc="$(enc_desc) -> $FS -> /"; else rootdesc="$FS -> /"; fi
 	layout_row "$ROOT_PART" "rest" "$rootdesc"
 }
 
@@ -607,6 +626,7 @@ lbl_boot() {
 		uki) printf 'UKI (unified kernel images)' ;;
 		efistub) printf 'EFISTUB (no boot menu)' ;;
 		syslinux) printf 'SYSLINUX (EXTLINUX)' ;;
+		zfsbootmenu) printf 'ZFSBootMenu' ;;
 		*)
 			if ! encrypted; then
 				printf 'GRUB'
@@ -625,7 +645,8 @@ lbl_sb() {
 }
 lbl_snapper() {
 	if [[ $SNAPPER != 1 ]]; then printf 'off'
-	elif [[ $FS != btrfs ]]; then printf '\\Z1on, but needs btrfs\\Zn'
+	elif zfs_on; then printf 'ZFS snapshots before pacman, bootable from ZFSBootMenu'
+	elif [[ $FS != btrfs ]]; then printf '\\Z1on, but needs btrfs or ZFS\\Zn'
 	elif [[ $BOOTLOADER == grub ]]; then printf 'snapper, bootable from GRUB'
 	else printf 'snapper (not in the boot menu)'; fi
 }
@@ -739,12 +760,36 @@ menu_disk() {
 
 menu_fs() {
 	local c
-	c=$(ui --title " Filesystem " --default-item "$FS" --menu "Root filesystem:" 11 78 2 \
-		ext4 "Classic journaling filesystem" \
-		btrfs "Subvolumes (@, @home, @snapshots, ...), zstd compression, snapshots") || return 1
+	local -a items=(ext4 "Classic journaling filesystem"
+		btrfs "Subvolumes (@, @home, ...), zstd compression, snapshots")
+	if [[ $FIRMWARE == uefi && $EFI_BITS == 64 ]]; then
+		items+=(zfs "ZFS pool (archzfs), booted by ZFSBootMenu; can sit on LUKS2")
+	fi
+	c=$(ui --title " Filesystem " --default-item "$FS" --menu "Root filesystem:" 12 78 3 "${items[@]}") || return 1
+	if [[ $c == zfs ]]; then
+		menu_zfs_info || return 1
+	elif zfs_on && [[ $BOOTLOADER == zfsbootmenu ]]; then
+		BOOTLOADER=grub
+		msg "ZFSBootMenu only boots ZFS, so the boot loader is now GRUB. Change it in the Bootloader item." "Boot loader"
+	fi
 	FS=$c
 	if [[ $FS == btrfs && $SNAPPER != 1 ]] &&
 		yesno "Take automatic btrfs snapshots with snapper (before and after every pacman transaction, plus hourly)?\n\nYou can change this later in the Snapshots item." "Snapshots"; then
+		SNAPPER=1
+	fi
+	return 0
+}
+
+# ZFS: what changes, and the choices that go with it.
+menu_zfs_info() {
+	yesno "ZFS is not in Arch's official repositories (its license). The installer uses the \Zbarchzfs\Zn repository (prebuilt and signed) for the live ISO and the new system.\n\n- Boot loader: \ZbZFSBootMenu\Zn, built on the new system. It can boot any snapshot.\n- With encryption the pool sits on \ZbLUKS2\Zn: ZFSBootMenu asks for the passphrase once.\n- Kernel updates wait until archzfs has the matching module (pacman says so); the LTS kernel is the calm choice.\n- No swap file (zram instead) and no Secure Boot with ZFS.\n- Installing needs a few minutes more: the live ISO gets ZFS first.\n\nUse ZFS?" "ZFS" 0 20 76 || return 1
+	BOOTLOADER=zfsbootmenu
+	if [[ $SWAP == file ]]; then SWAP=zram; fi
+	SECUREBOOT=0
+	if [[ $KERNELS != linux-lts ]] && yesno "Use only the LTS kernel (linux-lts)?\n\narchzfs builds a module for each kernel, but the LTS kernel changes least, so updates are held back least often. Now: $KERNELS" "ZFS kernel" 0 11 70; then
+		KERNELS=linux-lts
+	fi
+	if [[ $SNAPPER != 1 ]] && yesno "Take a ZFS snapshot of the system before every pacman transaction (the last 10 are kept)? ZFSBootMenu can boot any of them." "Snapshots"; then
 		SNAPPER=1
 	fi
 	return 0
@@ -787,6 +832,10 @@ ask_luks_pass() {
 
 menu_bootloader() {
 	local c note
+	if zfs_on; then
+		msg "With ZFS the boot loader is ZFSBootMenu. To use another boot loader, choose ext4 or btrfs in the Filesystem item." "Boot loader" 9 70
+		return 1
+	fi
 	local -a items=(
 		grub "GRUB 2 - can unlock an encrypted /boot"
 		limine "Limine - fast and simple; kernels on a FAT32 /boot")
@@ -839,6 +888,10 @@ menu_bootloader() {
 }
 
 menu_secureboot() {
+	if zfs_on; then
+		msg "Secure Boot is not offered with ZFS: ZFSBootMenu starts the kernel itself (kexec), which the firmware does not check." "Secure Boot" 9 70
+		return 1
+	fi
 	if [[ $FIRMWARE != uefi || $EFI_BITS != 64 ]]; then
 		msg "Secure Boot needs 64-bit UEFI firmware. This computer started with ${FIRMWARE^^}${EFI_BITS:+ ($EFI_BITS-bit)}." "Secure Boot"
 		return 1
@@ -856,8 +909,12 @@ menu_secureboot() {
 }
 
 menu_snapper() {
+	if zfs_on; then
+		if yesno "Take a ZFS snapshot of the system ($ZFS_BE) before every pacman transaction? The last 10 are kept, and ZFSBootMenu can boot any of them (Ctrl-S in its menu). /home is a separate dataset and is not rolled back." "Snapshots" 0 12 74; then SNAPPER=1; else SNAPPER=0; fi
+		return 0
+	fi
 	if [[ $FS != btrfs ]]; then
-		msg "Snapshots need the btrfs filesystem. Choose btrfs in the Filesystem item first." "Snapshots"
+		msg "Snapshots need btrfs or ZFS. Choose one of them in the Filesystem item first." "Snapshots"
 		return 1
 	fi
 	local where
@@ -875,6 +932,12 @@ menu_snapper() {
 
 menu_swap() {
 	local c s
+	if zfs_on; then
+		c=$(ui --title " Swap " --default-item "$SWAP" --menu "Swap space (a swap file is not offered on ZFS):" 11 70 2 \
+			none "No swap" zram "Compressed swap in RAM (zram-generator)") || return 1
+		SWAP=$c
+		return 0
+	fi
 	c=$(ui --title " Swap " --default-item "$SWAP" --menu "Swap space:" 12 70 3 \
 		none "No swap" \
 		zram "Compressed swap in RAM (zram-generator)" \
@@ -1803,8 +1866,23 @@ validate() {
 	if [[ $SECUREBOOT == 1 ]] && ! secureboot_on; then
 		yesno "Secure Boot is not possible with $(lbl_boot) on this computer and will be left off.\n\nContinue without it?" "Secure Boot" 0 || return 1
 	fi
-	if [[ $SNAPPER == 1 && $FS != btrfs ]]; then
-		yesno "Snapshots need btrfs; with $FS they are skipped.\n\nContinue without snapshots?" "Snapshots" 0 || return 1
+	if [[ $SNAPPER == 1 && $FS != btrfs && $FS != zfs ]]; then
+		yesno "Snapshots need btrfs or ZFS; with $FS they are skipped.\n\nContinue without snapshots?" "Snapshots" 0 || return 1
+	fi
+	if zfs_on && [[ $BOOTLOADER != zfsbootmenu ]]; then
+		msg "ZFS is booted by ZFSBootMenu. Choose ZFS again in the Filesystem item to set it up." "ZFS"
+		return 1
+	fi
+	if [[ $BOOTLOADER == zfsbootmenu ]] && ! zfs_on; then
+		msg "ZFSBootMenu only boots ZFS. Choose another boot loader, or ZFS in the Filesystem item." "Boot loader"
+		return 1
+	fi
+	if zfs_on && [[ $SWAP == file ]]; then
+		msg "A swap file on ZFS can hang the system under memory pressure. Choose zram or no swap (Swap item)." "Swap"
+		return 1
+	fi
+	if zfs_on && [[ ! -d /sys/firmware/efi/efivars ]]; then
+		yesno "The EFI variables are not available, so no UEFI boot entry can be written for ZFSBootMenu; it is also copied to the firmware's fallback path (EFI/BOOT), which most computers start.\n\nContinue?" "ZFSBootMenu" 0 11 72 || return 1
 	fi
 
 	if [[ -z $KERNELS ]]; then
@@ -1909,14 +1987,16 @@ step_prepare_live() {
 	if encrypted && ! command -v cryptsetup >/dev/null; then need+=(cryptsetup); fi
 	if ((${#need[@]} == 0)); then
 		echo "All tools needed by the installer are present."
-		return 0
+	else
+		echo "Installing into the live system: ${need[*]}"
+		pacman -S --needed --noconfirm "${need[@]}"
 	fi
-	echo "Installing into the live system: ${need[*]}"
-	pacman -S --needed --noconfirm "${need[@]}"
+	if zfs_on; then zfs_live_setup; fi
 }
 
 release_disk() {
 	local disk=$1 dev mp type sw
+	zfs_release_disk "$disk"
 	# Unmount everything on the disk (deepest devices first) and disable swap.
 	while read -r dev; do
 		while read -r mp; do
@@ -2004,7 +2084,9 @@ mount_target() {
 	local rootdev e sv mp
 	rootdev=$(root_device)
 	mkdir -p "$TARGET"
-	if [[ $FS == btrfs ]]; then
+	if zfs_on; then
+		: # the pool's datasets are mounted under $TARGET by zfs_create_pool
+	elif [[ $FS == btrfs ]]; then
 		mount -o "$BTRFS_OPTS,subvol=@" "$rootdev" "$TARGET"
 		for e in "${BTRFS_SUBVOLS[@]:1}"; do
 			sv=${e%%:*}
@@ -2064,6 +2146,7 @@ step_filesystems() {
 			if [[ $SWAP == file ]]; then btrfs subvolume create "$TARGET/@swap"; fi
 			umount "$TARGET"
 			;;
+		zfs) zfs_create_pool ;;
 	esac
 	if [[ -n $ESP_PART ]]; then mkfs.vfat -F 32 -n EFI "$ESP_PART"; fi
 	if [[ -n $BOOT_PART ]]; then
@@ -2076,7 +2159,7 @@ step_filesystems() {
 
 	echo "Mounting the new filesystems under $TARGET ..."
 	mount_target
-	if [[ $SWAP == file ]]; then make_swapfile; fi
+	if [[ $SWAP == file ]] && ! zfs_on; then make_swapfile; fi
 	findmnt -R "$TARGET" || true
 }
 
@@ -2115,10 +2198,21 @@ base_packages() {
 }
 
 # The initramfs: systemd-based hooks (sd-encrypt asks for the passphrase).
+# ZFS: archzfs's "zfs" hook needs the busybox-based hooks (udev, encrypt).
 write_mkinitcpio_conf() { # write_mkinitcpio_conf [early]
 	local hooks="base systemd autodetect microcode modconf kms keyboard sd-vconsole block"
-	if encrypted; then hooks+=" sd-encrypt"; fi
-	hooks+=" filesystems fsck"
+	if zfs_on; then
+		hooks="base udev autodetect microcode modconf kms keyboard keymap consolefont block"
+		# "early": zfs-utils (the zfs hook) is installed after pacstrap.
+		if [[ ${1:-} != early ]]; then
+			if encrypted; then hooks+=" encrypt"; fi
+			hooks+=" zfs"
+		fi
+		hooks+=" filesystems"
+	else
+		if encrypted; then hooks+=" sd-encrypt"; fi
+		hooks+=" filesystems fsck"
+	fi
 	# The NVIDIA driver must not compete with nouveau in early boot.
 	if [[ -n $(nvidia_driver) ]]; then hooks=${hooks/ kms/}; fi
 	mkdir -p "$TARGET/etc/mkinitcpio.conf.d"
@@ -2126,7 +2220,7 @@ write_mkinitcpio_conf() { # write_mkinitcpio_conf [early]
 		echo "# Written by arch-install.sh"
 		echo "HOOKS=($hooks)"
 		# "early": before pacstrap, when the key file does not exist yet.
-		if grub_unlocks && [[ ${1:-} != early ]]; then echo "FILES=(/etc/cryptsetup-keys.d/$CRYPT_NAME.key)"; fi
+		if needs_keyfile && [[ ${1:-} != early ]]; then echo "FILES=(/etc/cryptsetup-keys.d/$CRYPT_NAME.key)"; fi
 	} >"$TARGET/etc/mkinitcpio.conf.d/10-arch-install.conf"
 	echo "mkinitcpio hooks: $hooks"
 }
@@ -2160,6 +2254,7 @@ step_bootstrap() {
 	rm -f "$TARGET/etc/resolv.conf"
 	cp -L /etc/resolv.conf "$TARGET/etc/resolv.conf" || true
 	in_target pacman -Sy
+	if zfs_on; then zfs_target_setup; fi
 }
 
 set_locale() {
@@ -2180,13 +2275,15 @@ set_locale() {
 
 write_fstab() {
 	local fs_uuid boot_uuid="" esp_uuid="" e sv mp
-	fs_uuid=$(get_uuid "$(root_device)")
+	if ! zfs_on; then fs_uuid=$(get_uuid "$(root_device)"); fi
 	if [[ -n $BOOT_PART ]]; then boot_uuid=$(get_uuid "$BOOT_PART"); fi
 	if [[ -n $ESP_PART ]]; then esp_uuid=$(get_uuid "$ESP_PART"); fi
 	{
 		echo "# /etc/fstab - generated by arch-install.sh"
 		echo "# <device>                                 <dir>             <type> <options>                         <dump> <pass>"
-		if [[ $FS == btrfs ]]; then
+		if zfs_on; then
+			echo "# / and the other datasets of pool $ZPOOL are mounted by ZFS (zfs-mount.service)."
+		elif [[ $FS == btrfs ]]; then
 			for e in "${BTRFS_SUBVOLS[@]}"; do
 				sv=${e%%:*}
 				mp=${e#*:}
@@ -2208,7 +2305,7 @@ write_fstab() {
 		if [[ -n $ESP_PART ]]; then
 			printf 'UUID=%s  %-22s  vfat   defaults,noatime,umask=0077  0 2\n' "$esp_uuid" "$ESP_MOUNT"
 		fi
-		if [[ $SWAP == file ]]; then
+		if [[ $SWAP == file ]] && ! zfs_on; then
 			printf '%s  none  swap  defaults  0 0\n' "$(swapfile_path)"
 		fi
 	} >"$TARGET/etc/fstab"
@@ -2218,10 +2315,11 @@ write_fstab() {
 
 setup_crypt_target() {
 	local kf="/etc/cryptsetup-keys.d/$CRYPT_NAME.key"
-	if grub_unlocks; then
-		# GRUB already asked for the passphrase; a key file inside the (encrypted)
-		# initramfs unlocks root a second time without asking again. systemd's
-		# cryptsetup finds it by name in /etc/cryptsetup-keys.d.
+	if needs_keyfile; then
+		# GRUB (or ZFSBootMenu) already asked for the passphrase; a key file inside
+		# the initramfs, which lies on the encrypted disk, unlocks root a second
+		# time without asking again. systemd's cryptsetup finds it by name in
+		# /etc/cryptsetup-keys.d; the encrypt hook (ZFS) is told by cryptkey=.
 		echo "Adding a key file for the initramfs ..."
 		mkdir -p "$TARGET/etc/cryptsetup-keys.d"
 		chmod 700 "$TARGET/etc/cryptsetup-keys.d"
@@ -2250,6 +2348,232 @@ EOF
 	fi
 	# The kernel command line names the volume (rd.luks.name); no crypttab entry
 	# for root, so nothing asks a second time after the switch to the real root.
+}
+
+
+# =============================================================================
+#  ZFS (archzfs repository, ZFSBootMenu)
+# =============================================================================
+# The archzfs release key: from the project's keyring repository at a pinned
+# commit, else from a keyserver by its full fingerprint. Either way the
+# fingerprint is checked before pacman is told to trust it.
+archzfs_keyfile() { # archzfs_keyfile <output file>
+	local out=$1 g f fpr
+	g=$(mktemp -d) || return 1
+	for f in "$ARCHZFS_KEY.asc" "uid/$ARCHZFS_UID/$ARCHZFS_UID.asc" "uid/$ARCHZFS_UID/certification/$ARCHZFS_KEY.asc"; do
+		curl -fsSL --retry 3 "$ARCHZFS_KEYRING/$ARCHZFS_KEY/$f" -o "$g/part.asc" || break
+		gpg --homedir "$g" --dearmor <"$g/part.asc" >>"$g/key.gpg" || break
+	done
+	if [[ -s $g/key.gpg ]] && gpg --homedir "$g" --batch --quiet --import "$g/key.gpg" 2>/dev/null; then
+		fpr=$(gpg --homedir "$g" --with-colons --list-keys 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }')
+	fi
+	if [[ ${fpr:-} != "$ARCHZFS_KEY" ]]; then
+		echo "Keyring repository not usable; asking a keyserver for $ARCHZFS_KEY ..."
+		rm -f "$g/key.gpg"
+		gpg --homedir "$g" --batch --quiet --keyserver hkps://keyserver.ubuntu.com --recv-keys "$ARCHZFS_KEY" 2>/dev/null ||
+			gpg --homedir "$g" --batch --quiet --keyserver hkps://keys.openpgp.org --recv-keys "$ARCHZFS_KEY" 2>/dev/null || true
+		fpr=$(gpg --homedir "$g" --with-colons --list-keys 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }')
+		gpg --homedir "$g" --batch --export "$ARCHZFS_KEY" >"$g/key.gpg" 2>/dev/null || true
+	fi
+	if [[ ${fpr:-} != "$ARCHZFS_KEY" || ! -s $g/key.gpg ]]; then
+		echo "Could not get the archzfs signing key ($ARCHZFS_KEY)." >&2
+		rm -rf "$g"
+		return 1
+	fi
+	cp "$g/key.gpg" "$out" || return 1
+	rm -rf "$g"
+	echo "archzfs key $ARCHZFS_KEY: fingerprint checked."
+}
+
+archzfs_repo() { # archzfs_repo <pacman.conf>
+	grep -q '^\[archzfs\]' "$1" && return 0
+	printf '\n# ZFS for Arch Linux (added by arch-install.sh), signed by %s\n[archzfs]\nSigLevel = Required\nServer = %s\n' \
+		"$ARCHZFS_KEY" "$ARCHZFS_SERVER" >>"$1"
+}
+
+# "6.18.63-3-lts" -> "6.18.63-3"; "7.2.15-arch1-1" -> "7.2.15.arch1-1"
+kernel_pkgver() {
+	local r=$1
+	case $r in
+		*-lts | *-zen | *-hardened) r=${r%-*} ;;
+	esac
+	if [[ $r =~ ^([0-9.]+)-([a-z]+[0-9]+)-([0-9]+)$ ]]; then
+		echo "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}-${BASH_REMATCH[3]}"
+	else
+		echo "$r"
+	fi
+}
+
+# The linux=<version> a zfs-<kernel> package was built for (from "pacman -Si").
+zfs_built_for() { # zfs_built_for <kernel> <"pacman -Si" output>
+	awk -v k="$1" '
+		/^Depends On/ { on = 1 }
+		on && /^[A-Z][A-Za-z ]+:/ && !/^Depends On/ { on = 0 }
+		on { for (i = 1; i <= NF; i++) if (index($i, k "=") == 1) { print substr($i, length(k) + 2); exit } }' <<<"$2"
+}
+
+# ZFS on the live ISO: the prebuilt module when it matches the running kernel,
+# otherwise zfs-dkms with that kernel's headers from the Arch Linux Archive.
+zfs_live_setup() {
+	local kver pver info built hdr
+	if command -v zpool >/dev/null && modprobe zfs 2>/dev/null; then
+		echo "ZFS is already available on the live system."
+		return 0
+	fi
+	echo "Adding the archzfs repository to the live system ..."
+	archzfs_keyfile /tmp/archzfs.gpg || return 1
+	pacman-key --add /tmp/archzfs.gpg || return 1
+	pacman-key --lsign-key "$ARCHZFS_KEY" || return 1
+	# Only for the live system: pacstrap uses this file, and the new system gets
+	# the repository on its own (zfs_target_setup).
+	cp /etc/pacman.conf /tmp/pacman.conf.before-archzfs || return 1
+	archzfs_repo /etc/pacman.conf || return 1
+	pacman -Sy || return 1
+	kver=$(uname -r)
+	pver=$(kernel_pkgver "$kver")
+	info=$(pacman -Si archzfs/zfs-linux 2>/dev/null) || info=""
+	built=$(zfs_built_for linux "$info")
+	echo "Live kernel: $kver (package $pver); archzfs zfs-linux is built for linux ${built:-?}."
+	if [[ -n $built && $built == "$pver" ]] && pacman -S --needed --noconfirm zfs-utils zfs-linux; then
+		:
+	else
+		echo "No prebuilt module for this kernel: building zfs-dkms (a few minutes) ..."
+		# The live system's writable space is a RAM disk; the compiler needs room.
+		mount -o remount,size=75% /run/archiso/cowspace 2>/dev/null || true
+		hdr=$(pacman -Q linux-headers 2>/dev/null) || hdr=""
+		if [[ $hdr != "linux-headers $pver" ]]; then
+			pacman -U --needed --noconfirm "https://archive.archlinux.org/packages/l/linux-headers/linux-headers-$pver-x86_64.pkg.tar.zst" || {
+				echo "The headers of the live kernel ($pver) could not be downloaded. Use a recent Arch ISO." >&2
+				return 1
+			}
+		fi
+		pacman -S --needed --noconfirm zfs-utils zfs-dkms || return 1
+	fi
+	cp /tmp/pacman.conf.before-archzfs /etc/pacman.conf || return 1
+	modprobe zfs || {
+		echo "The ZFS module does not load on the live kernel $kver. Use a recent Arch ISO." >&2
+		return 1
+	}
+	echo "ZFS $(cat /sys/module/zfs/version 2>/dev/null) is loaded."
+}
+
+# Pools left imported by an earlier attempt that sit on this disk.
+zfs_release_disk() {
+	command -v zpool >/dev/null || return 0
+	local pool st
+	while read -r pool; do
+		[[ -n $pool ]] || continue
+		st=$(zpool status -P "$pool" 2>/dev/null) || continue
+		if grep -q -e "$1" -e "/dev/mapper/$CRYPT_NAME" -e /dev/disk/by-partuuid <<<"$st"; then
+			echo "Exporting ZFS pool $pool"
+			zpool export -f "$pool" 2>/dev/null || true
+		fi
+	done < <(zpool list -H -o name 2>/dev/null || true)
+}
+
+zfs_vdev() {
+	if encrypted; then
+		echo "/dev/mapper/$CRYPT_NAME"
+	else
+		local u
+		u=$(partuuid_of "$ROOT_PART")
+		if [[ -n $u && -e /dev/disk/by-partuuid/$u ]]; then echo "/dev/disk/by-partuuid/$u"; else echo "$ROOT_PART"; fi
+	fi
+}
+
+# Pool and datasets. The boot environment zroot/ROOT/arch holds / and /boot,
+# so a snapshot of it holds the kernels too; /home and the logs are separate.
+zfs_create_pool() {
+	local dev
+	dev=$(zfs_vdev)
+	# The same host id on the live system and the new one: the pool imports cleanly.
+	zgenhostid -f
+	echo "Creating ZFS pool $ZPOOL on $dev ..."
+	zpool create -f -o ashift=12 -o autotrim=on \
+		-O compression=lz4 -O acltype=posixacl -O xattr=sa -O relatime=on -O dnodesize=auto \
+		-O normalization=formD -O mountpoint=none -O canmount=off \
+		-R "$TARGET" "$ZPOOL" "$dev"
+	zfs create -o mountpoint=none "$ZPOOL/ROOT"
+	zfs create -o mountpoint=/ -o canmount=noauto "$ZFS_BE"
+	zfs mount "$ZFS_BE"
+	zfs create -o mountpoint=/home "$ZPOOL/home"
+	zfs create -o mountpoint=/var -o canmount=off "$ZPOOL/var"
+	zfs create "$ZPOOL/var/log"
+	zfs create -o canmount=off "$ZPOOL/var/cache"
+	zfs create "$ZPOOL/var/cache/pacman"
+	zpool set bootfs="$ZFS_BE" "$ZPOOL"
+	mkdir -p /etc/zfs
+	zpool set cachefile=/etc/zfs/zpool.cache "$ZPOOL"
+	zfs list -o name,mountpoint,canmount -r "$ZPOOL"
+}
+
+# The new system: the archzfs repository and key, the host id, the module for
+# every kernel (prebuilt when archzfs has the installed kernel's version, else
+# zfs-dkms), and the services that import and mount the pool.
+zfs_target_setup() {
+	local k info built have dkms=0
+	local -a pkgs=(zfs-utils)
+	archzfs_keyfile "$TARGET/root/archzfs.gpg"
+	in_target pacman-key --add /root/archzfs.gpg
+	in_target pacman-key --lsign-key "$ARCHZFS_KEY"
+	rm -f "$TARGET/root/archzfs.gpg"
+	archzfs_repo "$TARGET/etc/pacman.conf"
+	in_target pacman -Sy
+	cp /etc/hostid "$TARGET/etc/hostid"
+	mkdir -p "$TARGET/etc/zfs"
+	cp /etc/zfs/zpool.cache "$TARGET/etc/zfs/zpool.cache"
+	for k in $KERNELS; do
+		have=$(in_target pacman -Q "$k" | awk '{ print $2 }')
+		info=$(in_target pacman -Si "archzfs/zfs-$k" 2>/dev/null) || info=""
+		built=$(zfs_built_for "$k" "$info")
+		if [[ -n $built && $built == "$have" ]]; then
+			echo "$k $have: prebuilt module zfs-$k."
+			pkgs+=("zfs-$k")
+		else
+			echo "$k $have: archzfs has zfs-$k for ${built:-no version}; using zfs-dkms."
+			dkms=1
+		fi
+	done
+	if ((dkms)); then
+		pkgs=(zfs-utils zfs-dkms)
+		for k in $KERNELS; do pkgs+=("$k-headers"); done
+	fi
+	echo "Installing ${pkgs[*]} ..."
+	in_target pacman -S --needed --noconfirm "${pkgs[@]}"
+	in_target systemctl enable zfs-import-cache.service zfs-import.target zfs-mount.service zfs.target
+}
+
+zfs_snapshot_hook() { # zfs_snapshot_hook <root dir>
+	local root=$1
+	mkdir -p "$root/usr/local/bin" "$root/etc/pacman.d/hooks"
+	cat >"$root/usr/local/bin/zfs-pacman-snapshot" <<'EOF'
+#!/bin/bash
+# arch-install.sh: snapshot the running boot environment before pacman changes
+# it, and keep the newest KEEP of these snapshots. ZFSBootMenu can boot any of
+# them (select the boot environment, then Ctrl-S).
+KEEP=10
+[[ $(findmnt -no FSTYPE /) == zfs ]] || exit 0
+be=$(findmnt -no SOURCE /) || exit 0
+zfs snapshot "$be@pacman-$(date +%Y%m%d-%H%M%S)" || exit 0
+zfs list -H -t snapshot -o name -s creation -d 1 "$be" 2>/dev/null | grep -F "$be@pacman-" |
+	head -n -"$KEEP" | while read -r s; do zfs destroy "$s" || true; done
+exit 0
+EOF
+	chmod 755 "$root/usr/local/bin/zfs-pacman-snapshot"
+	cat >"$root/etc/pacman.d/hooks/05-zfs-snapshot.hook" <<'EOF'
+# arch-install.sh: a ZFS snapshot of the system before every pacman transaction
+[Trigger]
+Type = Package
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Target = *
+
+[Action]
+Description = Taking a ZFS snapshot of the system...
+When = PreTransaction
+Exec = /usr/local/bin/zfs-pacman-snapshot
+EOF
 }
 
 # Set a password. The password travels on stdin only: never in a command line,
@@ -2340,6 +2664,11 @@ target_packages() {
 			;;
 		systemd-boot | refind | uki | efistub) echo efibootmgr ;;
 		syslinux) echo syslinux ;;
+		zfsbootmenu)
+			# ZFSBootMenu's own dependencies (objcopy is in binutils)
+			printf '%s\n' efibootmgr kexec-tools fzf mbuffer perl perl-sort-versions perl-boolean perl-yaml-pp \
+				openssl ncurses binutils
+			;;
 	esac
 	if [[ $BOOTLOADER == refind ]]; then echo refind; fi
 	if secureboot_on; then echo sbctl; fi
@@ -3429,6 +3758,17 @@ step_bootstrap_user() {
 # initramfs (sd-vconsole), so it needs no option here.
 boot_cmdline() {
 	local c
+	if zfs_on; then
+		# Passed on by ZFSBootMenu, which adds root=zfs:<boot environment>.
+		c=""
+		if encrypted; then
+			c="cryptdevice=UUID=$(get_uuid "$ROOT_PART"):$CRYPT_NAME cryptkey=rootfs:/etc/cryptsetup-keys.d/$CRYPT_NAME.key "
+		fi
+		c+="rw loglevel=3"
+		if [[ -n $(nvidia_driver) ]]; then c+=" nvidia_drm.modeset=1"; fi
+		printf '%s\n' "$c"
+		return 0
+	fi
 	if encrypted; then
 		c="rd.luks.name=$(get_uuid "$ROOT_PART")=$CRYPT_NAME root=/dev/mapper/$CRYPT_NAME"
 	else
@@ -4082,6 +4422,158 @@ setup_snapper() {
 	echo "snapper: snapshots before/after every pacman transaction (snap-pac), hourly timeline."
 }
 
+# ---- ZFSBootMenu -----------------------------------------------------------------
+# Its release images cannot unlock LUKS, so it is built on the new system from
+# the pinned release, with mkinitcpio's encrypt hook: it asks for the
+# passphrase, imports the pool, lists the boot environments and snapshots, and
+# starts the chosen kernel (kexec). The system's initramfs unlocks the disk
+# again with the key file (it lies inside the encrypted pool, unlike
+# ZFSBootMenu's image on the EFI system partition, which holds no key).
+zbm_kernel() {
+	if has "$KERNELS" linux-lts; then echo linux-lts; else echo "${KERNELS%% *}"; fi
+}
+
+zbm_cmdline() {
+	local c="quiet loglevel=0"
+	if encrypted; then c="cryptdevice=UUID=$(get_uuid "$ROOT_PART"):$CRYPT_NAME $c"; fi
+	printf '%s\n' "$c"
+}
+
+write_zbm_config() { # write_zbm_config <root dir>
+	local root=$1 hooks="base udev modconf block keyboard keymap"
+	if encrypted; then hooks+=" encrypt"; fi
+	hooks+=" filesystems"
+	mkdir -p "$root/etc/zfsbootmenu/generate-zbm.post.d"
+	cat >"$root/etc/zfsbootmenu/config.yaml" <<EOF
+# Written by arch-install.sh. After editing, run: generate-zbm
+Global:
+  ManageImages: true
+  BootMountPoint: $ESP_MOUNT
+  InitCPIO: true
+  InitCPIOConfig: /etc/zfsbootmenu/mkinitcpio.conf
+  PostHooksDir: /etc/zfsbootmenu/generate-zbm.post.d
+Components:
+  Enabled: false
+EFI:
+  ImageDir: $ESP_MOUNT/EFI/zbm
+  Versions: false
+  Enabled: true
+  SplashImage: /usr/share/examples/zfsbootmenu/splash.bmp
+Kernel:
+  Path: /boot/vmlinuz-$(zbm_kernel)
+  Prefix: zfsbootmenu
+  CommandLine: $(zbm_cmdline)
+EOF
+	# Not /etc/mkinitcpio.conf: ZFSBootMenu's image must not get the system's
+	# FILES (the key file). mkinitcpio --config reads no drop-in directory.
+	cat >"$root/etc/zfsbootmenu/mkinitcpio.conf" <<EOF
+# Written by arch-install.sh: the initramfs of ZFSBootMenu itself. Holds no
+# key: it lies on the unencrypted EFI system partition. (generate-zbm adds
+# the zfsbootmenu hook.)
+MODULES=()
+BINARIES=()
+FILES=()
+HOOKS=($hooks)
+COMPRESSION=zstd
+EOF
+	cat >"$root/etc/zfsbootmenu/generate-zbm.post.d/10-efi-fallback" <<EOF
+#!/bin/sh
+# arch-install.sh: keep the firmware's fallback boot file up to date.
+mkdir -p $ESP_MOUNT/EFI/BOOT
+cp -f $ESP_MOUNT/EFI/zbm/zfsbootmenu.EFI $ESP_MOUNT/EFI/BOOT/BOOTX64.EFI
+EOF
+	chmod 755 "$root/etc/zfsbootmenu/generate-zbm.post.d/10-efi-fallback"
+	mkdir -p "$root/etc/pacman.d/hooks"
+	cat >"$root/etc/pacman.d/hooks/95-zfsbootmenu.hook" <<'EOF'
+# arch-install.sh: rebuild ZFSBootMenu after kernel or ZFS updates
+[Trigger]
+Type = Path
+Operation = Install
+Operation = Upgrade
+Target = usr/lib/modules/*/vmlinuz
+
+[Trigger]
+Type = Package
+Operation = Install
+Operation = Upgrade
+Target = zfs-utils
+Target = zfs-dkms
+Target = zfs-linux*
+
+[Action]
+Description = Rebuilding ZFSBootMenu...
+When = PostTransaction
+Exec = /usr/bin/generate-zbm
+EOF
+}
+
+install_zfsbootmenu() {
+	local src=/var/tmp/zfsbootmenu-src head first
+	echo "Building ZFSBootMenu $ZBM_VERSION ..."
+	rm -rf "$TARGET$src"
+	in_target git clone -q --depth 1 --branch "v$ZBM_VERSION" "$ZBM_GIT" "$src"
+	head=$(in_target git -C "$src" rev-parse HEAD)
+	if [[ $head != "$ZBM_COMMIT" ]]; then
+		echo "ZFSBootMenu v$ZBM_VERSION is commit $head, expected $ZBM_COMMIT; not installing it." >&2
+		return 1
+	fi
+	tools_add make
+	in_target make -C "$src" install
+	rm -rf "$TARGET$src"
+	tools_remove
+	write_zbm_config "$TARGET"
+	first=${KERNELS%% *}
+	# What ZFSBootMenu passes to the system's kernel; it adds root=zfs:<dataset>.
+	# Set on zroot/ROOT, so every boot environment and snapshot clone inherits it.
+	zfs set org.zfsbootmenu:commandline="$(boot_cmdline)" "$ZPOOL/ROOT"
+	zfs set org.zfsbootmenu:kernel="vmlinuz-$first" "$ZPOOL/ROOT"
+	in_target generate-zbm
+	efi_entry "ZFSBootMenu" '\EFI\zbm\zfsbootmenu.EFI' '\EFI\BOOT\BOOTX64.EFI'
+	echo "ZFSBootMenu: boots $ZFS_BE with $first; other kernels and snapshots from its menu."
+}
+
+verify_zfsbootmenu() {
+	local e="$TARGET$ESP_MOUNT" img=$ESP_MOUNT/EFI/zbm/zfsbootmenu.EFI listing
+	if [[ ! -s $TARGET$img ]]; then
+		echo "ZFSBootMenu: $img was not built" >&2
+		return 1
+	fi
+	if [[ ! -s $e/EFI/BOOT/BOOTX64.EFI ]]; then
+		echo "ZFSBootMenu: the fallback EFI/BOOT/BOOTX64.EFI is missing" >&2
+		return 1
+	fi
+	if [[ $(zpool get -H -o value bootfs "$ZPOOL") != "$ZFS_BE" ]]; then
+		echo "ZFS: bootfs of $ZPOOL is not $ZFS_BE" >&2
+		return 1
+	fi
+	if [[ ! -s $TARGET/etc/hostid ]]; then
+		echo "ZFS: /etc/hostid is missing" >&2
+		return 1
+	fi
+	if encrypted; then
+		# The image on the unencrypted EFI partition must not hold the key file.
+		rm -f "$TARGET/var/tmp/zbm-initrd"
+		if in_target objcopy -O binary --only-section=.initrd "$img" /var/tmp/zbm-initrd 2>/dev/null &&
+			listing=$(in_target lsinitcpio /var/tmp/zbm-initrd 2>/dev/null); then
+			rm -f "$TARGET/var/tmp/zbm-initrd"
+			if grep -q 'cryptsetup-keys.d' <<<"$listing"; then
+				rm -f "$TARGET$img" "$e/EFI/BOOT/BOOTX64.EFI"
+				echo "ZFSBootMenu: its image contains the disk key file; removed it" >&2
+				return 1
+			fi
+			if ! grep -q 'cryptsetup' <<<"$listing"; then
+				echo "ZFSBootMenu: its image has no cryptsetup (encrypt hook)" >&2
+				return 1
+			fi
+			echo "OK: ZFSBootMenu unlocks LUKS and holds no key file"
+		else
+			rm -f "$TARGET/var/tmp/zbm-initrd"
+			warn "Could not look inside the ZFSBootMenu image."
+		fi
+	fi
+	echo "OK: ZFSBootMenu ($img), boot environment $ZFS_BE"
+}
+
 install_systemd_boot() {
 	local e="$TARGET$ESP_MOUNT"
 	write_boot_tools "$TARGET"
@@ -4218,6 +4710,7 @@ step_bootloader() {
 		uki) install_uki ;;
 		efistub) install_efistub ;;
 		syslinux) install_syslinux ;;
+		zfsbootmenu) install_zfsbootmenu ;;
 	esac
 	sb_sign_all
 }
@@ -4294,7 +4787,21 @@ verify_install() {
 			echo "Missing $img for kernel $k" >&2
 			return 1
 		fi
-		if encrypted && [[ $BOOTLOADER != uki ]]; then
+		if zfs_on; then
+			listing=$(in_target lsinitcpio "$img")
+			if ! grep -q 'hooks/zfs' <<<"$listing"; then
+				echo "$img does not contain the zfs hook" >&2
+				return 1
+			fi
+			if encrypted && ! grep -q 'hooks/encrypt' <<<"$listing"; then
+				echo "$img does not contain the encrypt hook" >&2
+				return 1
+			fi
+			if needs_keyfile && ! grep -q "etc/cryptsetup-keys.d/$CRYPT_NAME.key" <<<"$listing"; then
+				echo "$img does not contain the LUKS key file" >&2
+				return 1
+			fi
+		elif encrypted && [[ $BOOTLOADER != uki ]]; then
 			listing=$(in_target lsinitcpio "$img")
 			if ! grep -q 'systemd-cryptsetup' <<<"$listing"; then
 				echo "$img does not contain systemd-cryptsetup (sd-encrypt)" >&2
@@ -4326,6 +4833,7 @@ verify_install() {
 			fi
 			echo "OK: /boot/limine/limine.conf"
 			;;
+		zfsbootmenu) verify_zfsbootmenu ;;
 		*) verify_boot_menu ;;
 	esac
 }
@@ -4336,6 +4844,7 @@ step_finalize() {
 	case $BOOTLOADER in
 		grub) in_target grub-mkconfig -o /boot/grub/grub.cfg ;;
 		limine) in_target /usr/local/bin/update-limine ;;
+		zfsbootmenu) : ;; # built by install_zfsbootmenu; finds the kernels itself
 		*) in_target /usr/local/bin/update-boot-menu ;;
 	esac
 	verify_install
@@ -4344,6 +4853,11 @@ step_finalize() {
 	rm -f "$TARGET$AUR_SUDOERS"
 	if snapper_on; then
 		in_target snapper --no-dbus -c root create -d "after arch-install.sh" || true
+	fi
+	if zfs_on; then
+		if zfs_snap_on; then zfs_snapshot_hook "$TARGET"; fi
+		# The freshly installed system, bootable from ZFSBootMenu's snapshot list.
+		zfs snapshot "$ZFS_BE@install" || warn "Could not snapshot $ZFS_BE."
 	fi
 	cp "$LOG" "$TARGET/var/log/arch-install.log" 2>/dev/null || true
 	# The settings of this install as a preset, to install the same system again.
@@ -4361,6 +4875,9 @@ cleanup_target() {
 	sync
 	if mountpoint -q "$TARGET" 2>/dev/null; then
 		umount -R "$TARGET" 2>/dev/null || umount -Rl "$TARGET" 2>/dev/null || true
+	fi
+	if zfs_on && command -v zpool >/dev/null && zpool list "$ZPOOL" >/dev/null 2>&1; then
+		zpool export "$ZPOOL" 2>/dev/null || zpool export -f "$ZPOOL" 2>/dev/null || true
 	fi
 	if [[ -e /dev/mapper/$CRYPT_NAME ]]; then
 		local i
@@ -4493,7 +5010,7 @@ do_install() {
 	titles+=("Installing packages") funcs+=(step_packages)
 	if bootstrap_wanted; then titles+=("Bootstrap: programs, dotfiles, shell") funcs+=(step_bootstrap_user); fi
 	titles+=("Building the initramfs, installing the boot loader ($BOOTLOADER)$(secureboot_on && echo ', Secure Boot')") funcs+=(step_bootloader)
-	titles+=("Finishing$(snapper_on && echo ': snapshots,') boot menu, checks") funcs+=(step_finalize)
+	titles+=("Finishing$({ snapper_on || zfs_on; } && echo ': snapshots,') boot menu, checks") funcs+=(step_finalize)
 
 	: >"$WARN_FILE"
 	log_settings
@@ -4565,10 +5082,10 @@ preset_check() { # preset_check <key> <value>
 	local re_host='[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?'
 	local re_path='(/[A-Za-z0-9._~%+=-]*)*'
 	case $k in
-		FS) one_of "$v" ext4 btrfs ;;
+		FS) one_of "$v" ext4 btrfs zfs ;;
 		ENC) one_of "$v" none luks1 luks2 ;;
 		GRUB_BOOT) one_of "$v" encrypted separate ;;
-		BOOTLOADER) one_of "$v" grub limine systemd-boot refind uki efistub syslinux ;;
+		BOOTLOADER) one_of "$v" grub limine systemd-boot refind uki efistub syslinux zfsbootmenu ;;
 		SWAP) one_of "$v" none zram file ;;
 		SWAP_SIZE) [[ $v =~ ^[1-9][0-9]{0,2}$ ]] && ((v <= 128)) ;;
 		SECUREBOOT | SNAPPER) one_of "$v" 0 1 ;;
@@ -4790,6 +5307,9 @@ preset_notes() {
 	fi
 	if bios_only && [[ $FIRMWARE != bios ]]; then
 		printf '\\Z1%s is for BIOS computers; this one uses UEFI. Choose another boot loader.\\Zn\\n' "$(lbl_boot)"
+	fi
+	if [[ $FS == zfs && $BOOTLOADER != zfsbootmenu ]] || [[ $FS != zfs && $BOOTLOADER == zfsbootmenu ]]; then
+		printf '\\Z1ZFS and ZFSBootMenu go together; this preset has FS=%s with %s.\\Zn\\n' "$FS" "$(lbl_boot)"
 	fi
 	if [[ -n $PRUNED ]]; then
 		printf 'Dotfile presets dropped (their desktop is not in the preset): %s\\n' "$PRUNED"
