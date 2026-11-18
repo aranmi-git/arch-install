@@ -1,0 +1,36 @@
+# arch-install preset v1
+# name: secure-gnome
+# id: secure-gnome@ca58c00b72d8b8b4
+# Made by arch-install.sh 1.0 on 2026-11-18.
+# Load it with:  bash arch-install.sh --preset <this file, an https link or a name>
+# Disk, passwords and users are never stored here; the installer asks for them.
+FS=ext4
+ENC=luks2
+GRUB_BOOT=encrypted
+BOOTLOADER=uki
+SECUREBOOT=1
+SNAPPER=0
+SWAP=zram
+SWAP_SIZE=4
+KERNELS=linux linux-lts
+MIRROR=auto
+HOST_NAME=archlinux
+KEYMAP=us
+LOCALE=en_US.UTF-8
+TIMEZONE=UTC
+NET=nm
+DESKTOP=gnome
+DM=gdm
+DOTS=
+GPU=auto
+APPS=firefox thunderbird libreoffice keepassxc
+GAMING=
+PERIPH=
+EXTRA_PKGS=
+AUR_HELPER=none
+AUR_PKGS=
+BS_PROGS=
+BS_DOTFILES=
+BS_BRANCH=
+BS_SHELL=bash
+BS_POWER=0
